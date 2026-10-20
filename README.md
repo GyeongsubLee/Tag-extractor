@@ -30,6 +30,10 @@ python valve_tag_extractor.py "D:\PID\PDF폴더"
 
 - 폴더를 생략하면 현재 폴더에서 실행합니다. 하위 폴더까지 검색합니다 (`--no-recursive` 로 끌 수 있음).
 - 결과는 해당 폴더에 `valve_tags.xlsx` 로 저장됩니다 (`-o result.csv` 처럼 CSV도 가능).
+- 추출된 Tag마다 **빨간 박스(RED BOX) 주석**을 친 PDF 사본이 `_tagged` 폴더에 원본과 같은 폴더 구조로 저장됩니다.
+  - 주석 설명(Comment) = 추출된 Valve Tag (예: `GLV-0030`), 주석 제목(Subject) = 상태(`ACTIVE`/`CHANGED`/`DELETED`…), 작성자 = `Valve Tag Extractor`
+  - 원본 PDF는 수정하지 않습니다. `_tagged` 폴더는 다음 실행 시 검색에서 제외됩니다.
+  - 폴더 변경: `--markup-dir 폴더명`, 끄기: `--no-markup`
 - Windows에서는 `run.bat` 을 PDF 폴더에서 실행해도 됩니다.
 - Prefix 변경: `--prefixes BFV,BV,CV,GLV,GV,SPV,SPI,GVL,GA,XV`
 

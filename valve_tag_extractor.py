@@ -48,6 +48,11 @@ DELETED = "DELETED"
 ADDED = "ADDED"
 CHECK = "CHECK"
 
+# Red box mark-up written to the copies in the mark-up folder
+MARKUP_DIR = "_tagged"
+MARKUP_AUTHOR = "Valve Tag Extractor"
+MARKUP_PAD = 1.5
+
 # Fraction of a tag's characters that must be hidden to call it deleted.
 DELETE_COVER_RATIO = 0.6
 
@@ -382,6 +387,25 @@ def hit_row(h: TagHit):
             h.note, h.annotations, round(h.rect.x0, 1), round(h.rect.y0, 1)]
 
 
+def write_markup(src: Path, dst: Path, hits):
+    """Save a copy of the PDF with a red box around every extracted tag.
+
+    The box's comment (contents) is the extracted valve tag, so it can be
+    reviewed / searched in the PDF viewer's comment list.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with pymupdf.open(src) as doc:
+        for h in hits:
+            page = doc[h.page - 1]
+            rect = pymupdf.Rect(h.rect) + (-MARKUP_PAD, -MARKUP_PAD, MARKUP_PAD, MARKUP_PAD)
+            annot = page.add_rect_annot(rect)
+            annot.set_colors(stroke=(1, 0, 0))
+            annot.set_border(width=1)
+            annot.set_info(content=h.tag, title=MARKUP_AUTHOR, subject=h.status)
+            annot.update()
+        doc.save(dst, garbage=1, deflate=True)
+
+
 def write_csv(path: Path, hits, errors):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -467,6 +491,9 @@ def main(argv=None):
                     help="output file (.xlsx or .csv, default: valve_tags.xlsx)")
     ap.add_argument("--prefixes", default=",".join(DEFAULT_PREFIXES),
                     help="comma separated tag prefixes (default: %(default)s)")
+    ap.add_argument("--markup-dir", default=MARKUP_DIR,
+                    help="folder for PDF copies with red boxes around extracted tags (default: %(default)s)")
+    ap.add_argument("--no-markup", action="store_true", help="do not write red-box PDF copies")
     ap.add_argument("--no-recursive", action="store_true", help="do not search sub folders")
     args = ap.parse_args(argv)
 
@@ -482,6 +509,11 @@ def main(argv=None):
         pdfs += sorted(p for p in root.glob("*.PDF") if p not in pdfs)
     else:
         pdfs += sorted(p for p in root.glob("**/*.PDF") if p not in pdfs)
+    markup_root = Path(args.markup_dir)
+    if not markup_root.is_absolute():
+        markup_root = root / markup_root
+    markup_root = markup_root.resolve()
+    pdfs = [p for p in pdfs if not p.resolve().is_relative_to(markup_root)]
     if not pdfs:
         sys.exit(f"No PDF files in {root}")
 
@@ -495,6 +527,8 @@ def main(argv=None):
             for h in file_hits:
                 counts[h.status] = counts.get(h.status, 0) + 1
             print("  ->", len(file_hits), "tags", counts if counts else "")
+            if not args.no_markup:
+                write_markup(pdf, markup_root / pdf.relative_to(root), file_hits)
         except Exception as exc:  # keep going with the other files
             errors.append((pdf.name, str(exc)))
             print("  -> ERROR:", exc)
@@ -507,6 +541,8 @@ def main(argv=None):
     else:
         write_xlsx(out, hits, errors)
     print(f"\n{len(hits)} tags from {len(pdfs)} PDF(s) -> {out}")
+    if not args.no_markup:
+        print(f"Red-box PDFs -> {markup_root}")
 
 
 if __name__ == "__main__":
