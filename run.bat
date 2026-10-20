@@ -1,4 +1,4 @@
 @echo off
-REM Drop this file in the PDF folder (or pass a folder) and double-click
-python "%~dp0valve_tag_extractor.py" %* "%CD%"
+REM Run from the PDF folder (double-click), or: run.bat "D:\PID\PDFs"
+if "%~1"=="" (python "%~dp0valve_tag_extractor.py" "%CD%") else (python "%~dp0valve_tag_extractor.py" %*)
 pause
