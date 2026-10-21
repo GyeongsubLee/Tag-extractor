@@ -179,47 +179,64 @@ def annot_visible_text(annot) -> str:
     return " ".join(normalize_text(text).split())
 
 
-def page_annotations(page) -> list:
+def page_annotations(page, warnings=None) -> list:
     result = []
-    for annot in page.annots() or []:
-        kind = annot.type[1]
-        if kind in ("Popup", "Link", "Widget"):
-            continue
+    try:
+        annot_list = list(page.annots() or [])
+    except Exception as exc:
+        if warnings is not None:
+            warnings.append(f"p{page.number + 1}: cannot read annotations ({exc})")
+        return result
+    for annot in annot_list:
         try:
-            if annot.flags & pymupdf.PDF_ANNOT_IS_HIDDEN:
-                continue
-        except Exception:
-            pass
-        opacity = annot.opacity if annot.opacity is not None and annot.opacity >= 0 else 1.0
-        info = annot.info or {}
-        content = " ".join((info.get("content") or "").split())
-        text = annot_visible_text(annot) if kind in TEXT_ANNOT_TYPES else ""
-        covers = False
-        if opacity >= 0.5:
-            if kind in ALWAYS_COVER_TYPES:
-                covers = True
-            elif kind in FILLABLE_TYPES and _fill_is_visible(annot.colors):
-                covers = True
-            elif kind in TEXT_ANNOT_TYPES:
-                covers = True  # a text box written over a tag replaces it
-        quads = []
-        if kind in STRIKE_TYPES:
-            verts = annot.vertices or []
-            for i in range(0, len(verts) - 3, 4):
-                quads.append(pymupdf.Quad(*verts[i:i + 4]).rect)
-            if not quads:
-                quads = [annot.rect]
-        result.append(Annotation(
-            kind=kind,
-            rect=pymupdf.Rect(annot.rect),
-            author=info.get("title", "") or "",
-            content=content,
-            text=text,
-            covers=covers,
-            strikes=kind in STRIKE_TYPES,
-            quads=quads,
-        ))
+            item = _read_annotation(annot)
+        except Exception as exc:  # one broken mark-up must not fail the file
+            if warnings is not None:
+                warnings.append(f"p{page.number + 1}: skipped annotation ({exc})")
+            continue
+        if item is not None:
+            result.append(item)
     return result
+
+
+def _read_annotation(annot):
+    kind = annot.type[1]
+    if kind in ("Popup", "Link", "Widget"):
+        return None
+    try:
+        if annot.flags & pymupdf.PDF_ANNOT_IS_HIDDEN:
+            return None
+    except Exception:
+        pass
+    opacity = annot.opacity if annot.opacity is not None and annot.opacity >= 0 else 1.0
+    info = annot.info or {}
+    content = " ".join((info.get("content") or "").split())
+    text = annot_visible_text(annot) if kind in TEXT_ANNOT_TYPES else ""
+    covers = False
+    if opacity >= 0.5:
+        if kind in ALWAYS_COVER_TYPES:
+            covers = True
+        elif kind in FILLABLE_TYPES and _fill_is_visible(annot.colors):
+            covers = True
+        elif kind in TEXT_ANNOT_TYPES:
+            covers = True  # a text box written over a tag replaces it
+    quads = []
+    if kind in STRIKE_TYPES:
+        verts = annot.vertices or []
+        for i in range(0, len(verts) - 3, 4):
+            quads.append(pymupdf.Quad(*verts[i:i + 4]).rect)
+        if not quads:
+            quads = [annot.rect]
+    return Annotation(
+        kind=kind,
+        rect=pymupdf.Rect(annot.rect),
+        author=info.get("title", "") or "",
+        content=content,
+        text=text,
+        covers=covers,
+        strikes=kind in STRIKE_TYPES,
+        quads=quads,
+    )
 
 
 def find_tags_in_lines(lines, full_re, prefix_re, number_re):
@@ -346,17 +363,19 @@ def evaluate_tag(prefix, number, chars, annots, full_re, number_re):
     return ACTIVE, original, rect, "", ann_desc
 
 
-def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re):
+def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re, warnings=None):
     hits = []
     rel = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
     with pymupdf.open(path) as doc, pymupdf.open(path) as clean:
         for pno, page in enumerate(doc, start=1):
-            annots = page_annotations(page)
+            annots = page_annotations(page, warnings)
             # MuPDF text extraction also returns annotation text, so read the
             # original drawing text from an in-memory copy without annotations.
+            # The page's /Annots list is dropped as a whole: deleting comments
+            # one by one also deletes their replies (IRT) and review states,
+            # which then breaks the iteration ("Annot is not bound to a page").
+            clean.xref_set_key(clean.page_xref(pno - 1), "Annots", "null")
             clean_page = clean[pno - 1]
-            for a in list(clean_page.annots() or []):
-                clean_page.delete_annot(a)
             lines = page_lines(clean_page)
             for prefix, number, chars in find_tags_in_lines(lines, full_re, prefix_re, number_re):
                 status, tag, rect, note, ann = evaluate_tag(prefix, number, chars, annots, full_re, number_re)
@@ -387,7 +406,7 @@ def hit_row(h: TagHit):
             h.note, h.annotations, round(h.rect.x0, 1), round(h.rect.y0, 1)]
 
 
-def write_markup(src: Path, dst: Path, hits):
+def write_markup(src: Path, dst: Path, hits, warnings=None):
     """Save a copy of the PDF with a red box around every extracted tag.
 
     The box's comment (contents) is the extracted valve tag, so it can be
@@ -396,13 +415,17 @@ def write_markup(src: Path, dst: Path, hits):
     dst.parent.mkdir(parents=True, exist_ok=True)
     with pymupdf.open(src) as doc:
         for h in hits:
-            page = doc[h.page - 1]
-            rect = pymupdf.Rect(h.rect) + (-MARKUP_PAD, -MARKUP_PAD, MARKUP_PAD, MARKUP_PAD)
-            annot = page.add_rect_annot(rect)
-            annot.set_colors(stroke=(1, 0, 0))
-            annot.set_border(width=1)
-            annot.set_info(content=h.tag, title=MARKUP_AUTHOR, subject=h.status)
-            annot.update()
+            try:
+                page = doc[h.page - 1]
+                rect = pymupdf.Rect(h.rect) + (-MARKUP_PAD, -MARKUP_PAD, MARKUP_PAD, MARKUP_PAD)
+                annot = page.add_rect_annot(rect)
+                annot.set_colors(stroke=(1, 0, 0))
+                annot.set_border(width=1)
+                annot.set_info(content=h.tag, title=MARKUP_AUTHOR, subject=h.status)
+                annot.update()
+            except Exception as exc:
+                if warnings is not None:
+                    warnings.append(f"p{h.page}: red box for {h.tag} failed ({exc})")
         doc.save(dst, garbage=1, deflate=True)
 
 
@@ -517,21 +540,35 @@ def main(argv=None):
     if not pdfs:
         sys.exit(f"No PDF files in {root}")
 
+    # MuPDF prints repairable PDF problems to the console; they are not fatal.
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)
+    except Exception:
+        pass
+
     hits, errors = [], []
     for i, pdf in enumerate(pdfs, start=1):
         print(f"[{i}/{len(pdfs)}] {pdf.name}", end="", flush=True)
+        warnings = []
         try:
-            file_hits = process_pdf(pdf, root, full_re, prefix_re, number_re)
-            hits.extend(file_hits)
-            counts = {}
-            for h in file_hits:
-                counts[h.status] = counts.get(h.status, 0) + 1
-            print("  ->", len(file_hits), "tags", counts if counts else "")
-            if not args.no_markup:
-                write_markup(pdf, markup_root / pdf.relative_to(root), file_hits)
+            file_hits = process_pdf(pdf, root, full_re, prefix_re, number_re, warnings)
         except Exception as exc:  # keep going with the other files
             errors.append((pdf.name, str(exc)))
             print("  -> ERROR:", exc)
+            continue
+        hits.extend(file_hits)
+        counts = {}
+        for h in file_hits:
+            counts[h.status] = counts.get(h.status, 0) + 1
+        print("  ->", len(file_hits), "tags", counts if counts else "")
+        if not args.no_markup:
+            try:
+                write_markup(pdf, markup_root / pdf.relative_to(root), file_hits, warnings)
+            except Exception as exc:
+                warnings.append(f"red-box PDF not saved ({exc})")
+        for w in warnings:
+            print("     WARNING:", w)
+            errors.append((pdf.name, "WARNING: " + w))
 
     out = Path(args.output)
     if not out.is_absolute():
