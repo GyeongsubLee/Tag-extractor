@@ -16,6 +16,14 @@
 예) `GLV-0024`의 `0024` 부분만 흰 박스로 가리고 텍스트 박스로 `0030`을 쓴 경우 →
 `Valve Tag = GLV-0030`, `Status = CHANGED`, `Original Tag = GLV-0024`
 
+### 붙여넣은 사진(이미지) 속 Tag
+- 도면에 캡처 이미지를 붙여넣은 경우(도면 안에 삽입 / 이미지 스탬프 주석 모두) 그 영역만 **OCR**로 읽어서 Tag를 추출합니다.
+  이미지가 없는 페이지는 OCR을 하지 않으므로 속도는 기존과 같습니다.
+- `Source` 열: `TEXT`(도면 텍스트), `PICTURE (OCR)`(도면에 삽입된 사진), `ANNOT PICTURE (OCR)`(이미지 주석), `ANNOT TEXT`(텍스트 주석)
+- `OCR Score` 열: OCR 신뢰도(0~1). 낮은 값은 한번 확인해 주세요.
+- 사진 밑에 가려진 원래 도면 Tag는 `DELETED`(Annotation = `Pasted picture`)로 표시됩니다. 같은 Tag가 사진에 다시 있으면 사진 쪽 하나만 남깁니다.
+- OCR 끄기: `--no-ocr`
+
 ## 설치
 
 ```

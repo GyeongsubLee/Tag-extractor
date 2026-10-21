@@ -120,6 +120,7 @@ class Annotation:
     strikes: bool
     quads: list = field(default_factory=list)
     used: bool = False
+    has_image: bool = False   # appearance contains a picture (pasted image / image stamp)
 
     def describe(self):
         parts = [self.kind]
@@ -142,6 +143,8 @@ class TagHit:
     rect: pymupdf.Rect
     note: str = ""
     annotations: str = ""
+    source: str = "TEXT"
+    score: float | None = None
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +230,17 @@ def _read_annotation(annot):
             quads.append(pymupdf.Quad(*verts[i:i + 4]).rect)
         if not quads:
             quads = [annot.rect]
+    has_image = False
+    try:
+        ap = annot.parent.parent.xref_get_key(annot.xref, "AP/N")
+        if ap[0] == "xref":
+            has_image = _xobject_has_image(annot.parent.parent, int(ap[1].split()[0]))
+    except Exception:
+        pass
+    if has_image and opacity >= 0.5:
+        covers = True  # an opaque picture hides the drawing below it
     return Annotation(
+        has_image=has_image,
         kind=kind,
         rect=pymupdf.Rect(annot.rect),
         author=info.get("title", "") or "",
@@ -237,6 +250,161 @@ def _read_annotation(annot):
         strikes=kind in STRIKE_TYPES,
         quads=quads,
     )
+
+
+def _xobject_has_image(doc, xref, depth=0) -> bool:
+    """True if the form XObject (annotation appearance) draws an image."""
+    if depth > 5:
+        return False
+    if doc.xref_get_key(xref, "Subtype")[1] == "/Image":
+        return True
+    typ, val = doc.xref_get_key(xref, "Resources/XObject")
+    if typ == "xref":
+        val = doc.xref_object(int(val.split()[0]), compressed=True)
+    for ref in re.findall(r"(\d+) 0 R", val if typ in ("dict", "xref") else ""):
+        if _xobject_has_image(doc, int(ref), depth + 1):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# OCR of pictures pasted into the drawing
+# --------------------------------------------------------------------------
+
+OCR_DPI = 300            # render resolution for pictures
+OCR_MIN_SCORE = 0.5      # discard OCR text below this confidence
+OCR_TILE_PX = 1600       # large pictures are OCR'd in tiles of this size
+MIN_IMAGE_PT = 20        # ignore icons / tiny pictures (points)
+OCR_FIX = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "|": "1"})
+
+
+class OcrEngine:
+    """Lazy wrapper around RapidOCR (pip install rapidocr_onnxruntime)."""
+
+    def __init__(self):
+        self._engine = None
+        self.error = None
+
+    def available(self) -> bool:
+        if self._engine is None and self.error is None:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                self._engine = RapidOCR()
+                self._api = 1
+            except ImportError:
+                try:
+                    from rapidocr import RapidOCR
+                    self._engine = RapidOCR()
+                    self._api = 2
+                except ImportError:
+                    self.error = ("OCR not installed (pip install rapidocr_onnxruntime) - "
+                                  "tags inside pasted pictures are skipped")
+        return self._engine is not None
+
+    def __call__(self, img):
+        """Return [(4 corner points in pixels, text, score)]."""
+        if self._api == 1:
+            result, _ = self._engine(img)
+            return [(r[0], r[1], float(r[2])) for r in (result or [])]
+        out = self._engine(img)
+        if out.boxes is None:
+            return []
+        return [(b.tolist(), t, float(sc)) for b, t, sc in zip(out.boxes, out.txts, out.scores)]
+
+
+def _pixmap_to_array(pix):
+    import numpy as np
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    return arr[:, :, :3].copy() if pix.n >= 3 else np.repeat(arr[:, :, :1], 3, axis=2)
+
+
+def fix_ocr_text(text, prefix_alt):
+    """Uppercase and repair typical OCR confusions in the number part of a tag."""
+    text = normalize_text(text).replace("_", "-").replace("~", "-")
+
+    def repl(m):
+        return m.group(1) + m.group(2).replace("=", "-") + m.group(3).translate(OCR_FIX)
+
+    return re.sub(rf"(?<![A-Z0-9])({prefix_alt})(\s*[-.=]?\s*)([0-9OQDIL|]{{2,6}})(?=[A-Z]?(?![A-Z0-9]))",
+                  repl, text)
+
+
+def ocr_region(page, rect, engine, prefix_alt, annots_shown=False):
+    """OCR one area of the page; returns [(Line in page coordinates, score)]."""
+    lines = []
+    tile = OCR_TILE_PX * 72.0 / OCR_DPI
+    overlap = 40.0
+    seen = []
+    y = rect.y0
+    while y < rect.y1:
+        x = rect.x0
+        while x < rect.x1:
+            clip = pymupdf.Rect(x, y, min(x + tile, rect.x1), min(y + tile, rect.y1))
+            if clip.width > 2 and clip.height > 2:
+                pix = page.get_pixmap(clip=clip, dpi=OCR_DPI, annots=annots_shown, alpha=False)
+                sx = clip.width / pix.width
+                sy = clip.height / pix.height
+                for box, text, score in engine(_pixmap_to_array(pix)):
+                    if score < OCR_MIN_SCORE or not text.strip():
+                        continue
+                    xs = [clip.x0 + pt[0] * sx for pt in box]
+                    ys = [clip.y0 + pt[1] * sy for pt in box]
+                    r = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
+                    text = fix_ocr_text(text, prefix_alt)
+                    if any(t == text and abs(r.x0 - o.x0) < 3 and abs(r.y0 - o.y0) < 3 for t, o in seen):
+                        continue  # same text found again in a tile overlap
+                    seen.append((text, r))
+                    lines.append((_ocr_line(text, r), score))
+            x += tile - overlap
+        y += tile - overlap
+    return lines
+
+
+def _ocr_line(text, r):
+    """Spread the characters of an OCR result evenly over its box."""
+    n = max(1, len(text))
+    chars = []
+    vertical = r.height > r.width * 1.5 and n > 2
+    for i, c in enumerate(text):
+        if vertical:
+            h = r.height / n
+            cr = pymupdf.Rect(r.x0, r.y1 - (i + 1) * h, r.x1, r.y1 - i * h)  # bottom-to-top text
+        else:
+            w = r.width / n
+            cr = pymupdf.Rect(r.x0 + i * w, r.y0, r.x0 + (i + 1) * w, r.y1)
+        chars.append(Char(c, cr))
+    return Line(chars, pymupdf.Rect(r))
+
+
+def content_pictures(clean_page):
+    """Pictures in the page content: [(rect, seqno, opaque)]."""
+    pics = []
+    for info in clean_page.get_image_info():
+        r = pymupdf.Rect(info["bbox"]) & clean_page.mediabox
+        if r.is_empty or r.width < MIN_IMAGE_PT or r.height < MIN_IMAGE_PT:
+            continue
+        pics.append((r, info.get("number", -1), not info.get("has-mask", False)))
+    return pics
+
+
+def hidden_by_pictures(clean_page, pics):
+    """Text drawn *before* an opaque picture inside its area is not visible.
+
+    Returned as pseudo annotations so evaluate_tag() treats them like a
+    white-out box.
+    """
+    covers = []
+    opaque = [(r, seq) for r, seq, op in pics if op and seq >= 0]
+    if not opaque:
+        return covers
+    for span in clean_page.get_texttrace():
+        sr = pymupdf.Rect(span["bbox"])
+        c = pymupdf.Point((sr.x0 + sr.x1) / 2, (sr.y0 + sr.y1) / 2)
+        for r, seq in opaque:
+            if span["seqno"] < seq and r.contains(c):
+                covers.append(Annotation("Pasted picture", sr, "", "", "", True, False))
+                break
+    return covers
 
 
 def find_tags_in_lines(lines, full_re, prefix_re, number_re):
@@ -363,8 +531,62 @@ def evaluate_tag(prefix, number, chars, annots, full_re, number_re):
     return ACTIVE, original, rect, "", ann_desc
 
 
-def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re, warnings=None):
+def ocr_pictures(page, clean_page, pics, pic_annots, annots, ocr, page_hits,
+                 rel, pno, full_re, prefix_re, number_re, prefix_alt, warnings):
+    """Add the tags read by OCR from pasted pictures to page_hits."""
+    if not ocr.available():
+        if warnings is not None:
+            warnings.append(f"p{pno}: {len(pics) + len(pic_annots)} picture(s) not read - {ocr.error}")
+        return page_hits
+    # Render unrotated (in memory only) so OCR boxes map straight to page coordinates.
+    clean_page.set_rotation(0)
+    page.set_rotation(0)
+    regions = [(r, clean_page, False, None, "PICTURE (OCR)") for r, _, _ in pics]
+    regions += [(a.rect, page, True, a, "ANNOT PICTURE (OCR)") for a in pic_annots]
+    for rect, src_page, shown, src_annot, source in regions:
+        try:
+            ocr_lines = ocr_region(src_page, rect, ocr, prefix_alt, shown)
+        except Exception as exc:
+            if warnings is not None:
+                warnings.append(f"p{pno}: OCR failed ({exc})")
+            continue
+        score_of = {id(c): sc for ln, sc in ocr_lines for c in ln.chars}
+        others = [a for a in annots if a is not src_annot]
+        for prefix, number, chars in find_tags_in_lines([ln for ln, _ in ocr_lines],
+                                                        full_re, prefix_re, number_re):
+            status, tag, trect, note, ann = evaluate_tag(prefix, number, chars, others, full_re, number_re)
+            score = min(score_of.get(id(c), 1.0) for c in chars)
+            if src_annot is not None:
+                ann = "; ".join(x for x in (src_annot.describe(), ann) if x)
+            page_hits.append(TagHit(rel, pno, tag, status, make_tag(prefix, number), trect,
+                                    note or "Read from pasted picture", ann, source=source, score=score))
+    return merge_ocr_duplicates(page_hits)
+
+
+def merge_ocr_duplicates(hits):
+    """Drop OCR hits that repeat a text tag at the same place.
+
+    A picture rendered for OCR also shows drawing text lying on top of it, and
+    a tag pasted again inside a picture hides the original text below it.  If
+    both name the same tag at the same place, keep the visible one.
+    """
+    text_hits = [h for h in hits if h.source == "TEXT"]
+    kept_ocr = []
+    drop = set()
+    for o in (h for h in hits if h.source != "TEXT"):
+        area = pymupdf.Rect(o.rect) + (-3, -3, 3, 3)
+        same = [t for t in text_hits if t.tag == o.tag and area.intersects(t.rect)]
+        if same and any(t.status != DELETED for t in same):
+            continue  # visible drawing text, already reported
+        drop.update(id(t) for t in same)  # picture re-shows a tag hidden below it
+        if not any(k.tag == o.tag and area.intersects(k.rect) for k in kept_ocr):
+            kept_ocr.append(o)
+    return [h for h in text_hits if id(h) not in drop] + kept_ocr
+
+
+def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re, warnings=None, ocr=None):
     hits = []
+    prefix_alt = full_re.pattern.split("(", 2)[2].split(")", 1)[0]
     rel = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
     with pymupdf.open(path) as doc, pymupdf.open(path) as clean:
         for pno, page in enumerate(doc, start=1):
@@ -377,17 +599,31 @@ def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re, warnings=
             clean.xref_set_key(clean.page_xref(pno - 1), "Annots", "null")
             clean_page = clean[pno - 1]
             lines = page_lines(clean_page)
+
+            # Pictures pasted into the drawing (page content or image stamps).
+            pics = content_pictures(clean_page)
+            pic_annots = [a for a in annots if a.has_image
+                          and a.rect.width >= MIN_IMAGE_PT and a.rect.height >= MIN_IMAGE_PT]
+            text_annots = annots + hidden_by_pictures(clean_page, pics) if pics else annots
+
+            page_hits = []
             for prefix, number, chars in find_tags_in_lines(lines, full_re, prefix_re, number_re):
-                status, tag, rect, note, ann = evaluate_tag(prefix, number, chars, annots, full_re, number_re)
-                hits.append(TagHit(rel, pno, tag, status,
-                                   make_tag(prefix, number), rect, note, ann))
+                status, tag, rect, note, ann = evaluate_tag(prefix, number, chars, text_annots, full_re, number_re)
+                page_hits.append(TagHit(rel, pno, tag, status,
+                                        make_tag(prefix, number), rect, note, ann))
+
+            if ocr is not None and (pics or pic_annots):
+                page_hits = ocr_pictures(page, clean_page, pics, pic_annots, annots, ocr, page_hits,
+                                         rel, pno, full_re, prefix_re, number_re, prefix_alt, warnings)
+            hits.extend(page_hits)
             # Tags that exist only inside annotations
             for a in annots:
                 if a.used or not a.text:
                     continue
                 for m in full_re.finditer(a.text):
                     hits.append(TagHit(rel, pno, make_tag(m.group(1), m.group(2)), ADDED, "",
-                                       a.rect, "Tag written only in an annotation", a.describe()))
+                                       a.rect, "Tag written only in an annotation", a.describe(),
+                                       source="ANNOT TEXT"))
     hits.sort(key=lambda h: (h.page, round(h.rect.y0), h.rect.x0))
     return hits
 
@@ -397,13 +633,14 @@ def process_pdf(path: Path, root: Path, full_re, prefix_re, number_re, warnings=
 # --------------------------------------------------------------------------
 
 COLUMNS = ["File", "Page", "Valve Tag", "Status", "Original Tag (text)",
-           "Note", "Annotation", "X", "Y"]
+           "Note", "Annotation", "Source", "OCR Score", "X", "Y"]
 
 
 def hit_row(h: TagHit):
     return [h.file, h.page, h.tag, h.status,
             h.original_tag if h.status in (CHANGED,) else ("" if h.status == ADDED else h.original_tag),
-            h.note, h.annotations, round(h.rect.x0, 1), round(h.rect.y0, 1)]
+            h.note, h.annotations, h.source, round(h.score, 2) if h.score is not None else "",
+            round(h.rect.x0, 1), round(h.rect.y0, 1)]
 
 
 def write_markup(src: Path, dst: Path, hits, warnings=None):
@@ -436,7 +673,7 @@ def write_csv(path: Path, hits, errors):
         for h in hits:
             w.writerow(hit_row(h))
         for file, err in errors:
-            w.writerow([file, "", "", "ERROR", "", err, "", "", ""])
+            w.writerow([file, "", "", "ERROR", "", err] + [""] * 5)
 
 
 def write_xlsx(path: Path, hits, errors):
@@ -463,7 +700,7 @@ def write_xlsx(path: Path, hits, errors):
                 c.fill = fills[h.status]
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for i, width in enumerate([40, 6, 16, 10, 18, 45, 60, 8, 8], start=1):
+    for i, width in enumerate([40, 6, 16, 10, 18, 45, 60, 20, 10, 8, 8], start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
 
     # Summary per file
@@ -517,6 +754,8 @@ def main(argv=None):
     ap.add_argument("--markup-dir", default=MARKUP_DIR,
                     help="folder for PDF copies with red boxes around extracted tags (default: %(default)s)")
     ap.add_argument("--no-markup", action="store_true", help="do not write red-box PDF copies")
+    ap.add_argument("--no-ocr", action="store_true",
+                    help="do not OCR pictures pasted into the drawings")
     ap.add_argument("--no-recursive", action="store_true", help="do not search sub folders")
     args = ap.parse_args(argv)
 
@@ -546,12 +785,13 @@ def main(argv=None):
     except Exception:
         pass
 
+    ocr = None if args.no_ocr else OcrEngine()
     hits, errors = [], []
     for i, pdf in enumerate(pdfs, start=1):
         print(f"[{i}/{len(pdfs)}] {pdf.name}", end="", flush=True)
         warnings = []
         try:
-            file_hits = process_pdf(pdf, root, full_re, prefix_re, number_re, warnings)
+            file_hits = process_pdf(pdf, root, full_re, prefix_re, number_re, warnings, ocr)
         except Exception as exc:  # keep going with the other files
             errors.append((pdf.name, str(exc)))
             print("  -> ERROR:", exc)
