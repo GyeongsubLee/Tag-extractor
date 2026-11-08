@@ -36,6 +36,16 @@ pip install -r requirements.txt
 python valve_tag_extractor.py "D:\PID\PDF폴더"
 ```
 
+- 시작하면 추출할 Tag 앞글자(Prefix)를 묻습니다. 하나 입력할 때마다 엔터, 다 입력했으면 `CLOSE` 엔터를 누르면 추출을 시작합니다.
+  ```
+  Prefix 1: STR
+  Prefix 2: FLX
+  Prefix 3: CLOSE
+  Extracting tags starting with: STR, FLX
+  ```
+  - 한 줄에 `STR, FLX` 처럼 여러 개를 적어도 되고, 소문자로 적어도 대문자로 바뀝니다.
+  - 아무것도 입력하지 않고 `CLOSE` 하면 기본값(`BFV, BV, CV, GLV, GV, SPV, SPI, GVL, GA`)으로 추출합니다.
+  - 묻지 않고 바로 실행하려면 `--prefixes STR,FLX` 를 붙입니다.
 - 폴더를 생략하면 현재 폴더에서 실행합니다. 하위 폴더까지 검색합니다 (`--no-recursive` 로 끌 수 있음).
 - 결과는 해당 폴더에 `valve_tags.xlsx` 로 저장됩니다 (`-o result.csv` 처럼 CSV도 가능).
 - 추출된 Tag마다 **빨간 박스(RED BOX) 주석**을 친 PDF 사본이 `_tagged` 폴더에 원본과 같은 폴더 구조로 저장됩니다.
@@ -43,7 +53,6 @@ python valve_tag_extractor.py "D:\PID\PDF폴더"
   - 원본 PDF는 수정하지 않습니다. `_tagged` 폴더는 다음 실행 시 검색에서 제외됩니다.
   - 폴더 변경: `--markup-dir 폴더명`, 끄기: `--no-markup`
 - Windows에서는 `run.bat` 을 PDF 폴더에서 실행해도 됩니다.
-- Prefix 변경: `--prefixes BFV,BV,CV,GLV,GV,SPV,SPI,GVL,GA,XV`
 
 ### 엑셀 시트
 - **Valve Tags**: 모든 Tag (파일, 페이지, Tag, 상태, 원래 Tag, 비고, 관련 주석, 좌표). 상태별 색상 표시

@@ -40,6 +40,8 @@ except ImportError:  # pragma: no cover - older PyMuPDF
 
 
 DEFAULT_PREFIXES = ["BFV", "BV", "CV", "GLV", "GV", "SPV", "SPI", "GVL", "GA"]
+END_WORD = "CLOSE"  # typing this ends the prefix input at start-up
+PREFIX_RE = re.compile(r"^[A-Z0-9]+$")
 
 # Status values
 ACTIVE = "ACTIVE"
@@ -64,6 +66,39 @@ FILLABLE_TYPES = {"Square", "Circle", "Polygon"}
 ALWAYS_COVER_TYPES = {"Redact", "Stamp"}
 STRIKE_TYPES = {"StrikeOut"}
 TEXT_ANNOT_TYPES = {"FreeText"}
+
+
+def ask_prefixes():
+    """Ask for the tag prefixes one per line until CLOSE is entered."""
+    print("Enter the tag prefixes to extract, one per line (e.g. STR, FLX), then press Enter.")
+    print(f"Type {END_WORD} when done.  "
+          f"{END_WORD} with nothing entered = default: {', '.join(DEFAULT_PREFIXES)}")
+    prefixes = []
+    while True:
+        try:
+            line = input(f"Prefix {len(prefixes) + 1}: ")
+        except EOFError:  # no console (e.g. input piped) - finish with what we have
+            break
+        words = [w.strip().upper() for w in line.replace(",", " ").split()]
+        if END_WORD in words:
+            words = words[:words.index(END_WORD)]
+            done = True
+        else:
+            done = False
+        for w in words:
+            w = w.rstrip("-")
+            if not PREFIX_RE.match(w):
+                print(f"  '{w}' skipped - use letters and digits only")
+            elif w in prefixes:
+                print(f"  '{w}' already entered")
+            else:
+                prefixes.append(w)
+        if done:
+            break
+    if not prefixes:
+        prefixes = list(DEFAULT_PREFIXES)
+    print("Extracting tags starting with: " + ", ".join(prefixes) + "\n")
+    return prefixes
 
 
 def build_patterns(prefixes):
@@ -749,8 +784,9 @@ def main(argv=None):
     ap.add_argument("folder", nargs="?", default=".", help="folder with PDF files (default: current folder)")
     ap.add_argument("-o", "--output", default="valve_tags.xlsx",
                     help="output file (.xlsx or .csv, default: valve_tags.xlsx)")
-    ap.add_argument("--prefixes", default=",".join(DEFAULT_PREFIXES),
-                    help="comma separated tag prefixes (default: %(default)s)")
+    ap.add_argument("--prefixes", default=None,
+                    help="comma separated tag prefixes, e.g. STR,FLX "
+                         f"(not given: asked at start; default {','.join(DEFAULT_PREFIXES)})")
     ap.add_argument("--markup-dir", default=MARKUP_DIR,
                     help="folder for PDF copies with red boxes around extracted tags (default: %(default)s)")
     ap.add_argument("--no-markup", action="store_true", help="do not write red-box PDF copies")
@@ -762,7 +798,10 @@ def main(argv=None):
     root = Path(args.folder).resolve()
     if not root.is_dir():
         sys.exit(f"Folder not found: {root}")
-    prefixes = [p.strip().upper() for p in args.prefixes.split(",") if p.strip()]
+    if args.prefixes:
+        prefixes = [p.strip().upper() for p in args.prefixes.split(",") if p.strip()]
+    else:
+        prefixes = ask_prefixes()
     full_re, prefix_re, number_re = build_patterns(prefixes)
 
     pattern = "*.pdf" if args.no_recursive else "**/*.pdf"
